@@ -19,6 +19,8 @@ from .auth import (
 from .db import Database
 from .store import (
     MAX_DEPENDENCIES,
+    AckBatchBlockedError,
+    AckBatchNotFoundError,
     BatchConflictError,
     DependencyError,
     EventBlockedError,
@@ -77,6 +79,17 @@ class BatchItemOut(EventOut):
 
 class EventBatchOut(BaseModel):
     items: list[BatchItemOut]
+
+
+class AckBatchIn(BaseModel):
+    # 按首次出现顺序去重（归并在 API 层完成），响应按原输入顺序逐项返回
+    event_ids: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(
+        min_length=1, max_length=100
+    )
+
+
+class AckBatchOut(BaseModel):
+    items: list[EventOut]
 
 
 @dataclass(frozen=True)
@@ -147,7 +160,7 @@ async def lifespan(app: FastAPI):
     db.close()
 
 
-app = FastAPI(title="Webhook Inbox", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="Webhook Inbox", version="1.3.0", lifespan=lifespan)
 
 
 def get_store(request: Request) -> EventStore:
@@ -419,3 +432,59 @@ def ack_event(event_id: str, store: EventStore = Depends(get_store)):
                 "blockers": exc.blockers,
             },
         )
+
+
+@app.post("/events/ack-batch", response_model=AckBatchOut)
+def ack_events_batch(
+    batch: AckBatchIn, store: EventStore = Depends(get_store)
+):
+    """批量确认（1~100 个 event_id），整批原子提交。
+
+    event_ids 按首次出现顺序去重；响应 items 按**原输入顺序**逐项返回
+    （重复 ID 映射到同一结果）。允许请求先列后继、再列前置：服务端在同一
+    个 SQLite 写事务内按依赖拓扑顺序确认，同批前置先于后继翻转；已确认
+    事件保持幂等，沿用单条确认的 status / acked_at 字段。任一 ID 不存在
+    返回 **404** 并给出缺失项及其在原输入中的下标；前置事件仍未确认且不
+    在本批待确认集合中时返回 **409**，逐项给出阻塞前置与下标；两种失败
+    均整批状态不变。
+    """
+    # 按首次出现去重，记录每个 ID 在原输入中的全部下标，用于错误定位
+    unique_ids: list[str] = []
+    positions: dict[str, list[int]] = {}
+    for idx, event_id in enumerate(batch.event_ids):
+        if event_id not in positions:
+            positions[event_id] = []
+            unique_ids.append(event_id)
+        positions[event_id].append(idx)
+
+    try:
+        results = store.ack_events_batch(unique_ids)
+    except AckBatchNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "some event_ids do not exist",
+                "missing": [
+                    {"event_id": event_id, "indices": positions[event_id]}
+                    for event_id in exc.event_ids
+                ],
+            },
+        )
+    except AckBatchBlockedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "events have pending dependencies outside the batch",
+                "blocked": [
+                    {
+                        "event_id": event_id,
+                        "indices": positions[event_id],
+                        "blockers": blockers,
+                    }
+                    for event_id, blockers in exc.blockers.items()
+                ],
+            },
+        )
+
+    by_id = dict(zip(unique_ids, results))
+    return {"items": [by_id[event_id] for event_id in batch.event_ids]}

@@ -65,6 +65,29 @@ class EventBlockedError(Exception):
         self.blockers = blockers
 
 
+class AckBatchNotFoundError(Exception):
+    """批量确认中存在库内不存在的 event_id（整批状态不变）。
+
+    event_ids 按“去重后批次”的首次出现顺序给出。
+    """
+
+    def __init__(self, event_ids: list[str]) -> None:
+        super().__init__(", ".join(event_ids))
+        self.event_ids = event_ids
+
+
+class AckBatchBlockedError(Exception):
+    """批量确认中仍有 pending 且不在本批待确认集合内的前置依赖（整批状态不变）。
+
+    blockers 以 event_id 为键归集，值为该事件的阻塞前置 event_id 列表
+    （字典序）；键按去重后批次的首次出现顺序排列。
+    """
+
+    def __init__(self, blockers: dict[str, list[str]]) -> None:
+        super().__init__(json.dumps(blockers, ensure_ascii=False))
+        self.blockers = blockers
+
+
 class ReplayError(Exception):
     """同来源的 nonce 已被登记（重放请求）。"""
 
@@ -596,3 +619,105 @@ class EventStore:
 
         row, deps = self._run_immediate_tx(operation)
         return _row_to_event(row, deps)
+
+    def ack_events_batch(self, event_ids: list[str]) -> list[dict]:
+        """在单一写事务内按依赖顺序批量确认事件。
+
+        event_ids 需已按首次出现去重（归并在 API 层完成）。任一 event_id
+        不存在则抛 AckBatchNotFoundError（按去重后顺序给出缺失项）；任一事件
+        仍有 pending 且不在本批待确认集合内的前置依赖则抛 AckBatchBlockedError
+        （按 event_id 归集阻塞项）——两种情况下整批回滚、状态不变。校验通过后，
+        待确认集合按依赖图做拓扑排序（允许请求先列后继、再列前置），在同一
+        事务内依次翻转：同批前置先于后继确认，因此后继的门禁在批内即可解除。
+        已 ack 事件保持幂等：不重复写入 acked_at，也不阻塞后继。返回与
+        event_ids（去重后顺序）对齐的事件记录列表。
+        """
+        if not event_ids:
+            return []
+        ids = event_ids
+        id_set = set(ids)
+        placeholders = ", ".join("?" for _ in ids)
+
+        def operation(conn):
+            rows = conn.execute(
+                f"SELECT * FROM events WHERE event_id IN ({placeholders})", ids
+            ).fetchall()
+            found = {row["event_id"]: row for row in rows}
+            missing = [event_id for event_id in ids if event_id not in found]
+            if missing:
+                raise AckBatchNotFoundError(missing)
+
+            # 批内依赖边（两端都在本批）；其余依赖边按当前库状态判定。
+            # 同批前置在本事务内会先被确认，不作为阻塞项；只引用批外事件
+            # 的边才参与门禁，语义与单条 ack 的 blockers 查询一致。
+            dep_rows = conn.execute(
+                f"""
+                SELECT event_id, depends_on FROM event_dependencies
+                WHERE event_id IN ({placeholders})
+                ORDER BY event_id, depends_on
+                """,
+                ids,
+            ).fetchall()
+            intra_edges: dict[str, list[str]] = {event_id: [] for event_id in ids}
+            blockers: dict[str, list[str]] = {}
+            for dep_row in dep_rows:
+                event_id, depends_on = dep_row["event_id"], dep_row["depends_on"]
+                if depends_on in id_set:
+                    intra_edges[event_id].append(depends_on)
+                    continue
+                prerequisite = conn.execute(
+                    "SELECT status FROM events WHERE event_id = ?", (depends_on,)
+                ).fetchone()
+                # 入箱事务保证引用落库；查不到行属于不变量被破坏，按阻塞处理
+                if prerequisite is None or prerequisite["status"] == STATUS_PENDING:
+                    blockers.setdefault(event_id, []).append(depends_on)
+            if blockers:
+                ordered_blockers = {event_id: blockers[event_id] for event_id in ids if event_id in blockers}
+                raise AckBatchBlockedError(ordered_blockers)
+
+            # 对“本批事件 ∪ 批内依赖边”做拓扑排序：边已按字典序取回，
+            # DFS 从去重后顺序的首个未访问节点开始、按邻接顺序推进，
+            # 后序逆序即确定的依赖顺序（前置先于后继）。落库图无环，
+            # 批内子图同样无环；发现回边只可能是不变量被破坏。
+            order: list[str] = []
+            color: dict[str, int] = {}  # 0=未访问 1=在栈中 2=已完成
+            for start in ids:
+                if color.get(start, 0) != 0:
+                    continue
+                stack: list[tuple[str, int]] = [(start, 0)]
+                color[start] = 1
+                while stack:
+                    node, edge_pos = stack[-1]
+                    neighbors = intra_edges[node]
+                    if edge_pos < len(neighbors):
+                        nxt = neighbors[edge_pos]
+                        stack[-1] = (node, edge_pos + 1)
+                        state = color.get(nxt, 0)
+                        if state == 0:
+                            color[nxt] = 1
+                            stack.append((nxt, 0))
+                        elif state == 1:
+                            raise RuntimeError(f"dependency cycle detected in ack batch: {nxt}")
+                    else:
+                        color[node] = 2
+                        order.append(node)
+                        stack.pop()
+            order.reverse()
+
+            for event_id in order:
+                if found[event_id]["status"] == STATUS_PENDING:
+                    conn.execute(
+                        "UPDATE events SET status = ?, acked_at = ? WHERE event_id = ?",
+                        (STATUS_ACKED, utcnow_iso(), event_id),
+                    )
+            final_rows = conn.execute(
+                f"SELECT * FROM events WHERE event_id IN ({placeholders})", ids
+            ).fetchall()
+            dep_map = _dependencies_for(conn, ids)
+            return final_rows, dep_map
+
+        final_rows, dep_map = self._run_immediate_tx(operation)
+        by_id = {row["event_id"]: row for row in final_rows}
+        return [
+            _row_to_event(by_id[event_id], dep_map[event_id]) for event_id in ids
+        ]

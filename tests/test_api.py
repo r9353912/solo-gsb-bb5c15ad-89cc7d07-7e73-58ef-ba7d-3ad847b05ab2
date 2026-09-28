@@ -18,6 +18,8 @@ from app.auth import (
 from app.db import Database
 from app.main import app
 from app.store import (
+    AckBatchBlockedError,
+    AckBatchNotFoundError,
     BatchConflictError,
     DependencyError,
     EventBlockedError,
@@ -1133,6 +1135,209 @@ def test_ack_blocked_on_acked_event_with_pending_successor(client):
     assert client.post("/events/b/ack").status_code == 200
 
 
+# ---------- 依赖门禁：批量确认 POST /events/ack-batch ----------
+
+
+def post_ack_batch(client, event_ids: list[str]):
+    return client.post("/events/ack-batch", json={"event_ids": event_ids})
+
+
+def test_ack_batch_reverse_order_confirms_chain_in_dependency_order(client):
+    # 请求先列后继、再列前置；事务内按依赖顺序全部确认
+    _chain(client, "c", "b", "a")
+    r = post_ack_batch(client, ["c", "b", "a"])
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert [it["event_id"] for it in items] == ["c", "b", "a"]  # 原输入顺序
+    assert all(it["status"] == "acked" for it in items)
+    assert all(it["acked_at"] for it in items)
+    assert all(it["depends_on"] == deps for it, deps in zip(items, [["b"], ["a"], []]))
+    for eid in ("a", "b", "c"):
+        assert client.get(f"/events/{eid}").json()["status"] == "acked"
+
+
+def test_ack_batch_response_uses_current_status_and_time_fields(client):
+    _chain(client, "b", "a")
+    first = client.post("/events/a/ack").json()  # 先单独确认 a
+    r = post_ack_batch(client, ["a", "b"])
+    assert r.status_code == 200
+    items = r.json()["items"]
+    # 已确认事件幂等：acked_at 保持首认时间，不被重写
+    assert items[0]["status"] == "acked"
+    assert items[0]["acked_at"] == first["acked_at"]
+    assert items[1]["status"] == "acked"
+    assert items[1]["acked_at"]
+    # /events/ready 不再列出任何项
+    assert client.get("/events/ready").json()["items"] == []
+
+
+def test_ack_batch_is_idempotent_on_repeat(client):
+    _chain(client, "c", "b", "a")
+    first = post_ack_batch(client, ["c", "b", "a"]).json()["items"]
+    again = post_ack_batch(client, ["c", "b", "a"]).json()["items"]
+    assert [it["acked_at"] for it in again] == [it["acked_at"] for it in first]
+    assert all(it["status"] == "acked" for it in again)
+
+
+def test_ack_batch_dedupes_by_first_occurrence_and_preserves_input_order(client):
+    for i in range(2):
+        post_event(client, make_event(i))
+    r = post_ack_batch(client, ["evt-0001", "evt-0000", "evt-0001"])
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert [it["event_id"] for it in items] == ["evt-0001", "evt-0000", "evt-0001"]
+    assert items[0] == items[2]  # 重复项映射到同一结果
+    assert all(it["status"] == "acked" for it in items)
+
+
+def test_ack_batch_single_id_equivalent_to_single_ack(client):
+    post_event(client, make_event(1))
+    r = post_ack_batch(client, ["evt-0001"])
+    assert r.status_code == 200
+    assert r.json()["items"][0] == client.get("/events/evt-0001").json()
+    assert r.json()["items"][0]["status"] == "acked"
+
+
+def test_ack_batch_missing_id_returns_404_with_indices_and_no_state_change(client):
+    _chain(client, "b", "a")
+    r = post_ack_batch(client, ["b", "ghost", "phantom", "ghost"])
+    assert r.status_code == 404
+    assert r.json()["detail"] == {
+        "message": "some event_ids do not exist",
+        "missing": [
+            {"event_id": "ghost", "indices": [1, 3]},
+            {"event_id": "phantom", "indices": [2]},
+        ],
+    }
+    # 整批状态不变
+    assert client.get("/events/a").json()["status"] == "pending"
+    assert client.get("/events/b").json()["status"] == "pending"
+
+
+def test_ack_batch_pending_external_prerequisite_returns_409_with_blockers(client):
+    _chain(client, "c", "b", "a")
+    # b 在批内（其后置 a 也在批内），但 c 的批外前置 p 未确认且不在批内
+    post_event(client, event_with_deps("p", []))
+    post_event(client, event_with_deps("d", ["p"]))
+    r = post_ack_batch(client, ["c", "b", "d", "a"])
+    assert r.status_code == 409
+    assert r.json()["detail"] == {
+        "message": "events have pending dependencies outside the batch",
+        "blocked": [
+            {"event_id": "d", "indices": [2], "blockers": ["p"]},
+        ],
+    }
+    # 整批状态不变（批内前置 a/b 同样未确认）
+    for eid in ("a", "b", "c", "d", "p"):
+        assert client.get(f"/events/{eid}").json()["status"] == "pending"
+
+
+def test_ack_batch_transitive_external_blocker_is_reported(client):
+    # 批内 c -> b -> a，而 a 依赖批外未确认的 p：a 被 p 阻塞即整批阻塞
+    post_event(client, event_with_deps("p", []))
+    events = [
+        event_with_deps("c", ["b"]),
+        event_with_deps("b", ["a"]),
+        event_with_deps("a", ["p"]),
+    ]
+    post_batch(client, events)
+    r = post_ack_batch(client, ["c", "b", "a"])
+    assert r.status_code == 409
+    blocked = r.json()["detail"]["blocked"]
+    assert blocked == [
+        {"event_id": "a", "indices": [2], "blockers": ["p"]},
+    ]
+    assert client.get("/events/c").json()["status"] == "pending"
+    # 前置 p 确认后，同一批次即可成功
+    client.post("/events/p/ack")
+    assert post_ack_batch(client, ["c", "b", "a"]).status_code == 200
+
+
+def test_ack_batch_missing_takes_precedence_over_blocked(client):
+    post_event(client, event_with_deps("a", []))
+    post_event(client, event_with_deps("b", ["a"]))
+    # 同时存在缺失 ID 与阻塞项：先报缺失（404），整批不变
+    r = post_ack_batch(client, ["b", "ghost"])
+    assert r.status_code == 404
+    assert r.json()["detail"]["missing"] == [{"event_id": "ghost", "indices": [1]}]
+    assert client.get("/events/a").json()["status"] == "pending"
+    assert client.get("/events/b").json()["status"] == "pending"
+
+
+def test_ack_batch_blocker_indices_expand_for_duplicates(client):
+    post_event(client, event_with_deps("p", []))
+    post_event(client, event_with_deps("d", ["p"]))
+    r = post_ack_batch(client, ["d", "d"])
+    assert r.status_code == 409
+    assert r.json()["detail"]["blocked"][0]["indices"] == [0, 1]
+    assert client.get("/events/d").json()["status"] == "pending"
+
+
+def test_ack_batch_all_blocked_events_are_listed_in_input_order(client):
+    post_event(client, event_with_deps("p1", []))
+    post_event(client, event_with_deps("p2", []))
+    post_event(client, event_with_deps("d1", ["p1"]))
+    post_event(client, event_with_deps("d2", ["p2"]))
+    r = post_ack_batch(client, ["d2", "d1"])
+    assert r.status_code == 409
+    blocked = r.json()["detail"]["blocked"]
+    assert [b["event_id"] for b in blocked] == ["d2", "d1"]  # 按去重后输入顺序
+    assert blocked[0]["blockers"] == ["p2"]
+    assert blocked[1]["blockers"] == ["p1"]
+
+
+def test_ack_batch_size_limits(client):
+    assert client.post("/events/ack-batch", json={"event_ids": []}).status_code == 422
+    assert (
+        client.post(
+            "/events/ack-batch", json={"event_ids": [f"e{i}" for i in range(101)]}
+        ).status_code
+        == 422
+    )
+    # 上限按去重前计数：同一 ID 重复 101 次同样拒绝
+    assert (
+        client.post(
+            "/events/ack-batch", json={"event_ids": ["e1"] * 101}
+        ).status_code
+        == 422
+    )
+
+
+def test_ack_batch_validation_errors(client):
+    assert client.post("/events/ack-batch", json={}).status_code == 422
+    assert client.post(
+        "/events/ack-batch", json={"event_ids": [""]}
+    ).status_code == 422
+    assert client.post(
+        "/events/ack-batch", json={"event_ids": ["x" * 129]}
+    ).status_code == 422
+    assert client.post(
+        "/events/ack-batch", json={"event_ids": [1, 2]}
+    ).status_code == 422
+
+
+def test_ack_batch_unlocks_ready_queue_within_same_commit(client):
+    _chain(client, "c", "b", "a")
+    post_event(client, make_event(99))  # 无依赖事件
+    post_ack_batch(client, ["c", "b", "a"])
+    ready = {e["event_id"] for e in client.get("/events/ready").json()["items"]}
+    assert ready == {"evt-0099"}  # a/b/c 已 ack，不再出现在就绪队列
+
+
+def test_ack_batch_requires_no_signature_headers(client):
+    # 与单条 ack 相同：确认接口不校验签名头
+    post_event(client, make_event(1))
+    r = client.post("/events/ack-batch", json={"event_ids": ["evt-0001"]})
+    assert r.status_code == 200
+
+
+def test_ack_batch_route_does_not_match_path_param_ack(client):
+    # /events/ack-batch 是静态路径，不会落到 /events/{event_id}/ack
+    post_event(client, make_event(1))
+    assert client.post("/events/evt-0001/ack").status_code == 200
+    assert post_ack_batch(client, ["evt-0001"]).status_code == 200
+
+
 def test_ready_never_lists_events_with_pending_transitive_dependency(client):
     # 菱形依赖：d 依赖 b、c；b、c 均依赖 a。只 ack a 时 d 不就绪
     events = [
@@ -1252,6 +1457,86 @@ def test_concurrent_ack_with_concurrent_parent_unlock_multi_connection(tmp_path)
     final = EventStore(Database(path))
     assert final.ack_event("pb")["status"] == "acked"
     final.db.close()
+
+
+# ---------- 依赖门禁：存储层批量确认 ----------
+
+
+def test_store_ack_batch_reverse_order_succeeds(store):
+    store.create_event("a", "t", {}, source=SOURCE, nonce="ab0")
+    store.create_event("b", "t", {}, source=SOURCE, nonce="ab1", depends_on=["a"])
+    store.create_event("c", "t", {}, source=SOURCE, nonce="ab2", depends_on=["b"])
+    records = store.ack_events_batch(["c", "b", "a"])
+    assert [r["event_id"] for r in records] == ["c", "b", "a"]  # 与去重后入参对齐
+    assert all(r["status"] == "acked" for r in records)
+    assert all(r["acked_at"] for r in records)
+    assert store.get_event("c")["status"] == "acked"
+
+
+def test_store_ack_batch_missing_raises_and_rolls_back(store):
+    store.create_event("a", "t", {}, source=SOURCE, nonce="abm0")
+    with pytest.raises(AckBatchNotFoundError) as exc:
+        store.ack_events_batch(["a", "ghost"])
+    assert exc.value.event_ids == ["ghost"]
+    # 同批中存在的 a 也未被确认（整批状态不变）
+    assert store.get_event("a")["status"] == "pending"
+
+
+def test_store_ack_batch_external_blocker_raises_and_rolls_back(store):
+    store.create_event("p", "t", {}, source=SOURCE, nonce="abb0")
+    store.create_event("d", "t", {}, source=SOURCE, nonce="abb1", depends_on=["p"])
+    store.create_event("x", "t", {}, source=SOURCE, nonce="abb2")
+    with pytest.raises(AckBatchBlockedError) as exc:
+        store.ack_events_batch(["d", "x"])
+    assert exc.value.blockers == {"d": ["p"]}
+    assert store.get_event("d")["status"] == "pending"
+    assert store.get_event("x")["status"] == "pending"  # 无阻塞的 x 同样不确认
+
+
+def test_store_ack_batch_keeps_acked_at_stable_on_repeat(store):
+    store.create_event("a", "t", {}, source=SOURCE, nonce="abr0")
+    first = store.ack_events_batch(["a"])[0]["acked_at"]
+    again = store.ack_events_batch(["a"])[0]["acked_at"]
+    assert again == first  # 幂等：不重写 acked_at
+
+
+def test_store_ack_batch_acknowledges_chain_in_dependency_order(store):
+    # 菱形：d 依赖 b、c；b、c 依赖 a。逆序入批也能在一个事务内全部确认
+    store.create_event("a", "t", {}, source=SOURCE, nonce="abd0")
+    store.create_event("b", "t", {}, source=SOURCE, nonce="abd1", depends_on=["a"])
+    store.create_event("c", "t", {}, source=SOURCE, nonce="abd2", depends_on=["a"])
+    store.create_event("d", "t", {}, source=SOURCE, nonce="abd3", depends_on=["b", "c"])
+    records = store.ack_events_batch(["d", "c", "b", "a"])
+    by_id = {r["event_id"]: r for r in records}
+    assert set(by_id) == {"a", "b", "c", "d"}
+    assert all(r["status"] == "acked" for r in records)
+    assert store.list_ready(limit=50)["items"] == []
+
+
+def test_concurrent_ack_batches_multi_connection(tmp_path):
+    """多连接并发批量确认同一批事件：全部成功且最终均 acked，无 500。"""
+    path = str(tmp_path / "ack-batch-race.db")
+    seed = EventStore(Database(path))
+    seed.create_event("a", "t", {}, source=SOURCE, nonce="seed-a")
+    seed.create_event("b", "t", {}, source=SOURCE, nonce="seed-b", depends_on=["a"])
+    seed.db.close()
+
+    def submit(_):
+        s = EventStore(Database(path))
+        try:
+            recs = s.ack_events_batch(["b", "a"])
+            return [r["status"] for r in recs]
+        finally:
+            s.db.close()
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(submit, range(32)))
+    assert all(statuses == ["acked", "acked"] for statuses in results)
+
+    checker = EventStore(Database(path))
+    assert checker.get_event("a")["status"] == "acked"
+    assert checker.get_event("b")["status"] == "acked"
+    checker.db.close()
 
 
 # ---------- 依赖门禁：存储层与旧库迁移 ----------
