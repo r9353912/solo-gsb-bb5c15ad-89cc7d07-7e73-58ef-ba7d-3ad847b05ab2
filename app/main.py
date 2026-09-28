@@ -19,6 +19,8 @@ from .auth import (
 from .db import Database
 from .store import (
     MAX_DEPENDENCIES,
+    BatchAckBlockedError,
+    BatchAckNotFoundError,
     BatchConflictError,
     DependencyError,
     EventBlockedError,
@@ -77,6 +79,17 @@ class BatchItemOut(EventOut):
 
 class EventBatchOut(BaseModel):
     items: list[BatchItemOut]
+
+
+class AckBatchIn(BaseModel):
+    # 每项沿用单条确认路径上的 event_id 约束；重复出现按首次出现去重
+    event_ids: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(
+        min_length=1, max_length=100
+    )
+
+
+class AckBatchOut(BaseModel):
+    items: list[EventOut]
 
 
 @dataclass(frozen=True)
@@ -147,7 +160,7 @@ async def lifespan(app: FastAPI):
     db.close()
 
 
-app = FastAPI(title="Webhook Inbox", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="Webhook Inbox", version="1.3.0", lifespan=lifespan)
 
 
 def get_store(request: Request) -> EventStore:
@@ -393,6 +406,63 @@ def list_ready_events(
         return store.list_ready(limit=limit, cursor=cursor)
     except InvalidCursorError:
         raise HTTPException(status_code=400, detail="invalid cursor")
+
+
+@app.post("/events/ack-batch", response_model=AckBatchOut)
+def ack_events_batch(
+    batch: AckBatchIn,
+    store: EventStore = Depends(get_store),
+):
+    """批量确认事件（1~100 个），整批原子。
+
+    按首次出现顺序对 event_ids 去重，允许请求先列后继、再列前置：事务内
+    按依赖顺序（拓扑序）确认同批待确认事件。已确认事件保持幂等（沿用
+    acked_at）。任一 ID 不存在返回 404；前置事件仍 pending 且不在本批待
+    确认集合中时返回 409 与每个阻塞条目的 blockers；两种失败均整批状态
+    不变。成功时按原输入顺序（含重复项展开）返回每项确认结果。
+    """
+    # 按首次出现顺序去重；indices 记录每个唯一 ID 在原始请求中的全部下标，
+    # 用于把存储层 pos 展开回原始下标
+    unique_ids: list[str] = []
+    indices: dict[str, list[int]] = {}
+    for idx, event_id in enumerate(batch.event_ids):
+        if event_id not in indices:
+            indices[event_id] = []
+            unique_ids.append(event_id)
+        indices[event_id].append(idx)
+
+    try:
+        records = store.ack_events_batch(unique_ids)
+    except BatchAckNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "event not found",
+                "missing": [
+                    {"event_id": event_id, "indices": indices[event_id]}
+                    for event_id in exc.event_ids
+                ],
+            },
+        )
+    except BatchAckBlockedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "event has pending dependencies",
+                "blocked": [
+                    {
+                        "event_id": unique_ids[error["index"]],
+                        "indices": indices[unique_ids[error["index"]]],
+                        "blockers": error["blockers"],
+                    }
+                    for error in exc.blocked
+                ],
+            },
+        )
+
+    record_by_id = {record["event_id"]: record for record in records}
+    items = [record_by_id[event_id] for event_id in batch.event_ids]
+    return {"items": items}
 
 
 @app.get("/events/{event_id}", response_model=EventOut)

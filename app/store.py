@@ -65,6 +65,27 @@ class EventBlockedError(Exception):
         self.blockers = blockers
 
 
+class BatchAckNotFoundError(Exception):
+    """批量确认中存在不存在的 event_id（整批未确认）。"""
+
+    def __init__(self, event_ids: list[str]) -> None:
+        super().__init__(", ".join(event_ids))
+        self.event_ids = event_ids
+
+
+class BatchAckBlockedError(Exception):
+    """批量确认中某些条目的前置依赖仍 pending，且不在本批待确认集合内。
+
+    blockers 按去重后批次位置归集：
+      {"pos": pos, "event_id": ..., "blockers": [event_id, ...]}
+    任一阻塞都导致整批回滚、状态不变。
+    """
+
+    def __init__(self, blocked: list[dict]) -> None:
+        super().__init__(json.dumps(blocked, ensure_ascii=False))
+        self.blocked = blocked
+
+
 class ReplayError(Exception):
     """同来源的 nonce 已被登记（重放请求）。"""
 
@@ -596,3 +617,110 @@ class EventStore:
 
         row, deps = self._run_immediate_tx(operation)
         return _row_to_event(row, deps)
+
+    def ack_events_batch(self, event_ids: list[str]) -> list[dict]:
+        """在单个写事务内按依赖顺序批量确认 1~100 个事件。
+
+        event_ids 需已在 API 层按首次出现顺序去重；允许请求先列后继、再列
+        前置——事务内对本批条目构成的子图做拓扑排序（依赖先于后继确认），
+        与输入顺序无关。
+
+        - 任一 event_id 不存在：抛 BatchAckNotFoundError，整批状态不变；
+        - 任一条目的前置依赖仍 pending 且不在本批集合内：抛
+          BatchAckBlockedError（携带该条目在去重后批次中的 pos 与 blockers），
+          整批状态不变；
+        - 已 ack 事件保持幂等（不重写 acked_at）；本批新确认的事件在同一
+          事务、同一确认时刻（每条单独打时间戳，按依赖先后严格不递减）翻转。
+
+        返回与 event_ids 顺序对齐的事件记录。门禁判定与全部状态翻转同在一个
+        BEGIN IMMEDIATE 事务内，与单条确认共用 status / acked_at 字段语义。
+        """
+        if not event_ids:
+            return []
+        ids = list(event_ids)
+        placeholders = ", ".join("?" for _ in ids)
+
+        def operation(conn):
+            rows = conn.execute(
+                f"SELECT * FROM events WHERE event_id IN ({placeholders})", ids
+            ).fetchall()
+            by_id = {row["event_id"]: row for row in rows}
+            missing = [event_id for event_id in ids if event_id not in by_id]
+            if missing:
+                raise BatchAckNotFoundError(missing)
+
+            dep_map = _dependencies_for(conn, ids)
+
+            # 一次查清本批条目当前仍 pending 的前置依赖（可能在批内也可能在批外）
+            dep_rows = conn.execute(
+                f"""
+                SELECT d.event_id AS event_id, d.depends_on AS depends_on, p.status AS status
+                FROM event_dependencies d
+                JOIN events p ON p.event_id = d.depends_on
+                WHERE d.event_id IN ({placeholders}) AND p.status = 'pending'
+                ORDER BY d.event_id, d.depends_on
+                """,
+                ids,
+            ).fetchall()
+            pending_deps: dict[str, list[str]] = {event_id: [] for event_id in ids}
+            for r in dep_rows:
+                pending_deps[r["event_id"]].append(r["depends_on"])
+
+            batch_set = set(ids)
+            blocked = [
+                {
+                    "index": pos,
+                    "event_id": event_id,
+                    "blockers": [dep for dep in pending_deps[event_id] if dep not in batch_set],
+                }
+                for pos, event_id in enumerate(ids)
+                if any(dep not in batch_set for dep in pending_deps[event_id])
+            ]
+            if blocked:
+                raise BatchAckBlockedError(blocked)
+
+            # 批内不存在外部阻塞：对本批待确认子图按依赖顺序拓扑确认。
+            # 已 ack 的事件直接就绪；落库图无环（入箱事务保证），故不会死锁。
+            acked: set[str] = {
+                event_id
+                for event_id in ids
+                if by_id[event_id]["status"] == STATUS_ACKED
+            }
+            remaining = [event_id for event_id in ids if event_id not in acked]
+            while remaining:
+                ready = [
+                    event_id
+                    for event_id in remaining
+                    if all(dep in acked for dep in pending_deps[event_id])
+                ]
+                if not ready:
+                    # 理论上不可达：落库图无环且批外阻塞已被上面拒绝。
+                    raise BatchAckBlockedError(
+                        [
+                            {
+                                "index": ids.index(event_id),
+                                "event_id": event_id,
+                                "blockers": pending_deps[event_id],
+                            }
+                            for event_id in remaining
+                        ]
+                    )
+                for event_id in ready:
+                    conn.execute(
+                        "UPDATE events SET status = ?, acked_at = ? WHERE event_id = ?",
+                        (STATUS_ACKED, utcnow_iso(), event_id),
+                    )
+                    acked.add(event_id)
+                remaining = [event_id for event_id in remaining if event_id not in acked]
+
+            rows = conn.execute(
+                f"SELECT * FROM events WHERE event_id IN ({placeholders})", ids
+            ).fetchall()
+            final_dep_map = _dependencies_for(conn, ids)
+            return rows, final_dep_map
+
+        rows, final_dep_map = self._run_immediate_tx(operation)
+        by_id = {row["event_id"]: row for row in rows}
+        return [
+            _row_to_event(by_id[event_id], final_dep_map[event_id]) for event_id in ids
+        ]

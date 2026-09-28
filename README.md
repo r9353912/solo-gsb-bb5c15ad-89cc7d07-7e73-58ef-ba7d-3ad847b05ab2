@@ -1,6 +1,6 @@
 # Webhook Inbox
 
-基于 FastAPI + SQLite 的 webhook 收件箱服务。接收事件、**来源签名校验与重放防护**、幂等去重、**事件依赖门禁**、按时间游标分页查询、就绪队列与单条确认，数据持久化到 SQLite。
+基于 FastAPI + SQLite 的 webhook 收件箱服务。接收事件、**来源签名校验与重放防护**、幂等去重、**事件依赖门禁**、按时间游标分页查询、就绪队列、单条确认与**批量确认**，数据持久化到 SQLite。
 
 ## 功能
 
@@ -24,6 +24,7 @@
 - **GET /events** 按时间游标分页查询（键集分页，支持 `status` 过滤）
 - **GET /events/ready** 沿用相同游标规则，只列出**全部依赖均已 ack 的 pending 事件**；前置事件确认后后继**立即解锁**
 - **POST /events/{event_id}/ack** 单条确认（幂等，重复确认返回当前状态）；尚有未完成依赖时返回 **409** 与 `blockers` 列表
+- **POST /events/ack-batch** 批量确认（1~100 个 event_id，无需签名头）：按首次出现顺序去重、按原输入顺序返回每项结果；**允许先列后继、再列前置**，服务端在同一 SQLite 写事务内按依赖顺序确认；已确认事件幂等。任一 ID 不存在（**404**）或前置仍 pending 且不在本批待确认集合中（**409**，给出阻塞项与 `blockers`）时，可定位到原始下标且**整批状态不变**
 - **GET /events/{event_id}** 查询单条事件
 - 事件、处理状态（`pending` / `acked`）与依赖边持久化到 SQLite，**启动时自动建表**；含 `used_nonces` 防重放表与 `event_dependencies` 依赖表，升级已有数据库时只增量补表、不动旧数据
 
@@ -169,6 +170,9 @@ curl -i -X POST http://localhost:8000/events \
 | 批内内容冲突 422；与库中内容冲突 409（均整批零写入，nonce 不登记，可用新 nonce 重试） | 422 / 409 |
 | 依赖校验失败：引用不存在、自依赖、批内依赖环（单条与批量均整批零写入） | 422 |
 | 确认事件时仍有未完成（pending）的前置依赖 | 409，返回 `blockers` |
+| 批量确认含不存在的 event_id | 404，返回 `missing`（含原始下标），整批状态不变 |
+| 批量确认中前置仍 pending 且不在本批 | 409，返回 `blocked`（每项含原始下标与 `blockers`），整批状态不变 |
+| 批量确认 `event_ids` 为空或超过 100 个、含空字符串 | 422 |
 
 ## API 一览
 
@@ -180,6 +184,7 @@ curl -i -X POST http://localhost:8000/events \
 | GET | `/events/ready?limit=&cursor=` | 只列全部依赖均已 ack 的 pending 事件，游标规则同 `/events` |
 | GET | `/events/{event_id}` | 查询单条事件，不存在 `404` |
 | POST | `/events/{event_id}/ack` | 确认事件（幂等），不存在 `404`，尚有未完成依赖 `409`（含 `blockers`） |
+| POST | `/events/ack-batch` | 批量确认 1~100 个 event_id（无需签名头）。先列后继再列前置亦可，事务内按依赖顺序确认，按原输入顺序返回；不存在 `404`、外部前置未确认 `409`（均含原始下标，整批状态不变），入参不合法 `422` |
 | GET | `/healthz` | 健康检查 |
 
 ### 提交事件
@@ -341,6 +346,60 @@ curl -X POST http://localhost:8000/events/evt-001/ack
 
 把 `blockers` 中的事件逐一确认后即可确认本事件（已 ack 的依赖不再出现在 `blockers` 中）。
 
+### 批量确认
+
+`POST /events/ack-batch` 一次确认 1~100 个事件（与单条确认一样**无需签名头**）。请求体为 `event_ids` 数组：按**首次出现顺序去重**，允许请求**先列后继、再列前置**——服务端在同一个 SQLite 写事务内按依赖顺序（前置先于后继）确认；已确认事件保持幂等（沿用其既有 `acked_at`，不重写）。响应按**原输入顺序**返回每项完整事件（重复项映射到同一结果），字段与单条确认完全一致：
+
+```bash
+curl -X POST http://localhost:8000/events/ack-batch \
+  -H 'Content-Type: application/json' \
+  -d '{"event_ids": ["evt-003", "evt-002", "evt-001"]}'
+```
+
+假设 `evt-003 → evt-002 → evt-001`（后继列在前置之前），仍返回 `200` 且整链一次确认完毕：
+
+```json
+{
+  "items": [
+    {"event_id": "evt-003", "type": "invoice.issued", "payload": {}, "status": "acked", "created_at": "2026-09-21T03:00:00.000200Z", "acked_at": "2026-09-21T04:00:00.000002Z", "depends_on": ["evt-002"]},
+    {"event_id": "evt-002", "type": "order.paid", "payload": {}, "status": "acked", "created_at": "2026-09-21T03:00:00.000100Z", "acked_at": "2026-09-21T04:00:00.000001Z", "depends_on": ["evt-001"]},
+    {"event_id": "evt-001", "type": "order.created", "payload": {}, "status": "acked", "created_at": "2026-09-21T03:00:00.000000Z", "acked_at": "2026-09-21T04:00:00.000000Z", "depends_on": []}
+  ]
+}
+```
+
+任一 ID 不存在返回 `404`，`missing` 给出缺失项在**原始请求数组**中的下标，整批状态不变（同批其他事件也不会被确认）：
+
+```json
+{
+  "detail": {
+    "message": "event not found",
+    "missing": [{"event_id": "evt-ghost", "indices": [1]}]
+  }
+}
+```
+
+某条目的前置事件仍未确认、且**不在本批待确认集合**中时返回 `409`，`blocked` 逐项给出原始下标与 `blockers`，整批状态不变。下例中 `evt-002` 未在批内且仍 pending：
+
+```bash
+curl -X POST http://localhost:8000/events/ack-batch \
+  -H 'Content-Type: application/json' \
+  -d '{"event_ids": ["evt-003", "evt-001"]}'
+```
+
+```json
+{
+  "detail": {
+    "message": "event has pending dependencies",
+    "blocked": [
+      {"event_id": "evt-003", "indices": [0], "blockers": ["evt-002"]}
+    ]
+  }
+}
+```
+
+只要阻塞项也列在本批（任意位置），即按依赖顺序解锁——把上面的 `evt-002` 补进请求（`["evt-003", "evt-001", "evt-002"]`）即可整批成功。`event_ids` 为空、超过 100 个或元素为空字符串返回 `422`。
+
 ## 幂等、防重放与并发设计
 
 - **签名先于解析**：入箱路由先读取原始请求体完成 HMAC 校验，再解析 JSON。这样即使请求体是畸形 JSON，鉴权失败仍返回 401（而非让 422 绕过验签），且鉴权阶段完全不触碰数据库，天然零写入。
@@ -351,6 +410,7 @@ curl -X POST http://localhost:8000/events/evt-001/ack
 - **依赖门禁内置于写事务**：单条入箱在插入前查库确认引用存在；批量入箱在同一 `BEGIN IMMEDIATE` 事务内完成「引用存在性（库中 ∪ 同批任意位置）+ 自依赖 + 批内环」检测。环检测只在批内新节点构成的子图上进行（库图在不变更既有边的前提下保证无环），报告的环路径首尾相接。任一错误整批回滚、nonce 不登记。
 - 依赖边存于独立的 `event_dependencies(event_id, depends_on)` 表（复合主键去重、集合语义），不修改既有 `events` 行；旧库启动时以 `CREATE TABLE IF NOT EXISTS` 增量建表并保留全部旧数据，旧事件视为无依赖、天然就绪。
 - **就绪判定与确认门禁**：`/events/ready` 与确认接口都以「不存在指向 pending 事件的依赖边」为准（单条 NOT EXISTS / JOIN 查询）。ack 只会把 pending 翻转为 acked，就绪集合随确认单调扩大，因此前置确认提交后后继立即解锁。确认路径同样运行在 `BEGIN IMMEDIATE` 事务内：门禁检查与状态翻转原子完成，多连接并发确认同一事件恰好翻转一次，其余请求幂等成功，不会出现“读到依赖已消失但状态未更新”的中间态。
+- **批量确认同一事务内按依赖顺序翻转**：`/events/ack-batch` 在单个 `BEGIN IMMEDIATE` 事务内一次性完成「存在性检查 + 外部阻塞判定 + 批内拓扑序确认 + 回读」。请求先列后继再列前置合法：批内条目的 pending 前置只要也在本批即不算阻塞，事务内沿依赖边做拓扑确认（落库图无环，入箱时已拒绝环）；前置在批外且仍 pending 才整体拒绝（409）并回滚。任一 ID 不存在（404）同样回滚，不存在部分确认；已 ack 条目幂等跳过、`acked_at` 保持首确值，多连接并发批次彼此串行。
 - 批量写入在**单一事务**内完成「nonce 登记 + 查库比对 + 依赖校验 + 全部事件/依赖边插入 + 回读」（连接级锁 + `BEGIN IMMEDIATE`），并发批次彼此串行：任一冲突即整批回滚，不产生部分提交，也不会覆盖首个版本。
 - 验签使用 `hmac.compare_digest` 常量时间比较；所有鉴权失败返回相同的 401 响应，不泄露失败环节。
 
@@ -377,7 +437,7 @@ environment:
 ```bash
 pip install -r requirements-dev.txt
 export WEBHOOK_SECRETS_JSON='{"demo":{"current":"dev-only-secret-change-me"}}'
-pytest tests/ -q                 # 85 个测试：签名/重放/密钥轮换、幂等、409、分页、依赖门禁（缺失/自依赖/环）、就绪解锁、ack 并发、批量原子性、旧库迁移、持久化
+pytest tests/ -q                 # 103 个测试：签名/重放/密钥轮换、幂等、409、分页、依赖门禁（缺失/自依赖/环）、就绪解锁、ack 并发、批量提交/批量确认原子性、旧库迁移、持久化
 DATABASE_PATH=./events.db uvicorn app.main:app --reload --port 8000
 ```
 
@@ -387,7 +447,7 @@ DATABASE_PATH=./events.db uvicorn app.main:app --reload --port 8000
 app/
   main.py    # FastAPI 路由、签名头依赖与请求模型（验签后手动解析原始体）
   auth.py    # WEBHOOK_SECRETS_JSON 解析、HMAC-SHA256 验签、时间窗与轮换宽限
-  store.py   # nonce 登记 + 幂等写入与依赖校验（同一写事务）、依赖环检测、游标分页、就绪队列、门禁确认（存储层）
+  store.py   # nonce 登记 + 幂等写入与依赖校验（同一写事务）、依赖环检测、游标分页、就绪队列、门禁确认与批量拓扑确认（存储层）
   db.py      # SQLite 连接、WAL、自动建表（events / used_nonces / event_dependencies）
 tests/
   test_api.py
